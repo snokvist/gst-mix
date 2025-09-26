@@ -1,12 +1,18 @@
 // UDP source selector + low-latency H.265 viewer via GStreamer appsrc (IPv4 only).
-// Adds "stats" on stdin:
-//   • Per-source UDP counters + RTP analysis (unique/expected/lost/dup/reorder, RFC3550 jitter)
-//   • Decoder info: width×height/format/framerate + instant/avg FPS (probe on vaapih265dec:src)
-//   • QoS bus watcher: per-element aggregates (processed/dropped, jitter last/avg/min/max, proportion, quality)
+// Pipeline matches your gst-launch line (adapted for appsrc):
+//   appsrc (is-live, RTP/H265 caps) !
+//   queue leaky=downstream max-size-buffers=96 max-size-time=0 max-size-bytes=0 !
+//   rtpjitterbuffer latency=4 drop-on-latency=true do-lost=true post-drop-messages=true !
+//   rtph265depay !
+//   h265parse config-interval=-1 !
+//   video/x-h265,stream-format=byte-stream,alignment=au !
+//   vah265dec ! queue ! waylandsink sync=false
 //
-// Pipeline (low-latency oriented):
-//   appsrc (is-live, format=bytes, RTP caps) ! capsfilter ! queue(leaky) ! rtpjitterbuffer(latency=8)
-//     ! rtph265depay ! vaapih265dec ! xvimagesink
+// Keeps:
+//   • UDP relay with per-source discovery and selection (by src IP:port), pushing packets into appsrc
+//   • Per-source RTP analysis (unique/expected/lost/dup/reorder, RFC3550 jitter)
+//   • Decoder FPS/caps (probe on decoder:src)
+//   • QoS bus watcher (per-element aggregates), now fed by jitterbuffer drop messages.
 //
 // Build (Ubuntu/Debian):
 //   sudo apt install build-essential pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-vaapi
@@ -104,7 +110,10 @@ typedef struct {
     GstElement *queue0;
     GstElement *jbuf;
     GstElement *depay;
+    GstElement *parser;
+    GstElement *capsf_h265;
     GstElement *decoder;
+    GstElement *queue_postdec;
     GstElement *sink;
 } GstCtx;
 
@@ -118,17 +127,15 @@ typedef struct {
 
 // QoS per-element aggregates
 typedef struct {
-    guint64 processed;          // from QoS message (format-dependent)
+    guint64 processed;
     guint64 dropped;
-    guint64 events;             // number of QoS messages seen
-
-    gint64  last_jitter_ns;     // QoS jitter from message (ns, signed)
+    guint64 events;
+    gint64  last_jitter_ns;
     gint64  min_jitter_ns;
     gint64  max_jitter_ns;
     long double sum_abs_jitter_ns;
-
-    gdouble last_proportion;    // <1: speed up, >1: slow down (sink perspective)
-    gint    last_quality;       // 0..100 (typical)
+    gdouble last_proportion;
+    gint    last_quality;
     gboolean live;
 } QoSStats;
 
@@ -268,8 +275,21 @@ static inline void rtp_update_stats(Source *s, const unsigned char *p, size_t le
 }
 
 // ---------------- QoS DB ----------------
+typedef struct {
+    guint64 processed;
+    guint64 dropped;
+    guint64 events;
+    gint64  last_jitter_ns;
+    gint64  min_jitter_ns;
+    gint64  max_jitter_ns;
+    long double sum_abs_jitter_ns;
+    gdouble last_proportion;
+    gint    last_quality;
+    gboolean live;
+} QoSStatsImpl;
+
 static void qos_stats_free(gpointer data) {
-    QoSStats *qs = (QoSStats*)data;
+    QoSStatsImpl *qs = (QoSStatsImpl*)data;
     g_free(qs);
 }
 static void qos_db_init(QoSDB *db) {
@@ -282,10 +302,9 @@ static void qos_db_clear(QoSDB *db) {
 }
 
 static void qos_update_from_msg(GstMessage *msg) {
-    // Identify the element that emitted the QoS
     GstObject *src = GST_MESSAGE_SRC(msg);
     if (!src) return;
-    gchar *path = gst_object_get_path_string(src); // e.g. "pipeline0/dec"
+    gchar *path = gst_object_get_path_string(src);
     if (!path) return;
 
     gboolean live = FALSE;
@@ -300,18 +319,18 @@ static void qos_update_from_msg(GstMessage *msg) {
     gst_message_parse_qos_values(msg, &jitter_ns, &proportion, &quality);
 
     g_mutex_lock(&g_qos.lock);
-    QoSStats *qs = (QoSStats*)g_hash_table_lookup(g_qos.table, path);
+    QoSStatsImpl *qs = (QoSStatsImpl*)g_hash_table_lookup(g_qos.table, path);
     if (!qs) {
-        qs = g_new0(QoSStats, 1);
+        qs = g_new0(QoSStatsImpl, 1);
         qs->min_jitter_ns = G_MAXINT64;
         qs->max_jitter_ns = G_MININT64;
         g_hash_table_insert(g_qos.table, path, qs); // takes ownership of 'path'
     } else {
-        g_free(path); // key existed; free our temp
+        g_free(path); // key existed
     }
 
     qs->events++;
-    qs->processed = processed; // latest snapshot
+    qs->processed = processed;
     qs->dropped   = dropped;
     qs->last_jitter_ns  = jitter_ns;
     if (jitter_ns < qs->min_jitter_ns) qs->min_jitter_ns = jitter_ns;
@@ -336,7 +355,7 @@ static void qos_print(void) {
     g_print("---- QoS (per element) ----\n");
     while (g_hash_table_iter_next(&it, &k, &v)) {
         const char *path = (const char*)k;
-        QoSStats *qs = (QoSStats*)v;
+        QoSStatsImpl *qs = (QoSStatsImpl*)v;
         double last_ms = qs->last_jitter_ns / 1e6;
         double avg_ms  = (qs->events ? (double)(qs->sum_abs_jitter_ns / (long double)qs->events) / 1e6 : 0.0);
         double min_ms  = (qs->min_jitter_ns==G_MAXINT64?0.0: (qs->min_jitter_ns/1e6));
@@ -378,7 +397,7 @@ static void stats_print(RelayCtx *rc, GstCtx *gc) {
             char ibuf[64]; print_human_bitrate(ibps, ibuf, sizeof(ibuf));
             double age_s = (s->last_seen_us > 0) ? (now_us - s->last_seen_us)/1e6 : -1.0;
 
-            // Expected vs unique (may decrease "lost" as late packets arrive)
+            // Expected vs unique
             uint64_t expected = 0, lost = 0;
             if (s->rtp_init) {
                 expected = (uint64_t)(s->max_ext_seq - s->first_ext_seq + 1);
@@ -660,88 +679,119 @@ static GstPadProbeReturn dec_src_probe(GstPad *pad, GstPadProbeInfo *info, gpoin
 }
 
 static gboolean build_pipeline(GstCtx *gc) {
-    gc->appsrc_e = gst_element_factory_make("appsrc", "src");
-    gc->queue0   = gst_element_factory_make("queue", "q0");
-    gc->jbuf     = gst_element_factory_make("rtpjitterbuffer", "jbuf");
-    gc->depay    = gst_element_factory_make("rtph265depay", "depay");
-    gc->decoder  = gst_element_factory_make("vaapih265dec", "dec");
+    gc->appsrc_e      = gst_element_factory_make("appsrc", "src");
+    gc->queue0        = gst_element_factory_make("queue", "q0");
+    gc->jbuf          = gst_element_factory_make("rtpjitterbuffer", "jbuf");
+    gc->depay         = gst_element_factory_make("rtph265depay", "depay");
+    gc->parser        = gst_element_factory_make("h265parse", "h265parse");
+    gc->capsf_h265    = gst_element_factory_make("capsfilter", "cf_h265");
+    gc->decoder       = gst_element_factory_make("vah265dec", "dec");    // primary
     if (!gc->decoder) {
-        gc->decoder = gst_element_factory_make("avdec_h265", "dec");
-        if (gc->decoder) g_printerr("Using avdec_h265 (software) fallback.\n");
+        gc->decoder = gst_element_factory_make("vaapih265dec", "dec");     // fallback 1
+        if (!gc->decoder) {
+            gc->decoder = gst_element_factory_make("avdec_h265", "dec");     // fallback 2
+            if (gc->decoder) g_printerr("Using avdec_h265 (software) fallback.\n");
+        }
     }
-    gc->sink     = gst_element_factory_make("xvimagesink", "xvsink");
-    GstElement *capsf  = gst_element_factory_make("capsfilter", "capsf");
+    gc->queue_postdec = gst_element_factory_make("queue", "q_postdec");
+    gc->sink          = gst_element_factory_make("waylandsink", "wsink"); // primary
+    if (!gc->sink) {
+        gc->sink = gst_element_factory_make("glimagesink", "glsink");
+        if (!gc->sink) {
+            gc->sink = gst_element_factory_make("xvimagesink", "xvsink");
+            if (!gc->sink) {
+                gc->sink = gst_element_factory_make("autovideosink", "vsink");
+            }
+        }
+    }
+    GstElement *capsf_rtp  = gst_element_factory_make("capsfilter", "cf_rtp");
 
-    if (!gc->appsrc_e || !capsf || !gc->queue0 || !gc->jbuf || !gc->depay || !gc->decoder || !gc->sink) {
+    if (!gc->appsrc_e || !capsf_rtp || !gc->queue0 || !gc->jbuf || !gc->depay ||
+        !gc->parser || !gc->capsf_h265 || !gc->decoder || !gc->queue_postdec || !gc->sink) {
         g_printerr("Failed to create one or more GStreamer elements.\n");
+    return FALSE;
+        }
+
+        gc->pipeline = gst_pipeline_new("udp-h265-viewer");
+        if (!gc->pipeline) { g_printerr("Failed to create pipeline.\n"); return FALSE; }
+
+        // appsrc RTP caps (include media=video)
+        gchar *caps_rtp_str = g_strdup_printf(
+            "application/x-rtp,media=video,encoding-name=H265,payload=%d,clock-rate=%d",
+            gc->payload, gc->clockrate);
+        GstCaps *caps_rtp = gst_caps_from_string(caps_rtp_str);
+        g_free(caps_rtp_str);
+        if (!caps_rtp) { g_printerr("Failed to build RTP caps.\n"); return FALSE; }
+
+        // h265 byte-stream caps after parser
+        GstCaps *caps_h265 = gst_caps_from_string("video/x-h265,stream-format=byte-stream,alignment=au");
+        if (!caps_h265) { g_printerr("Failed to build H265 caps.\n"); gst_caps_unref(caps_rtp); return FALSE; }
+
+        // appsrc config
+        g_object_set(gc->appsrc_e,
+                     "is-live", TRUE,
+                     "format", GST_FORMAT_BYTES,     // 1 buffer = 1 RTP datagram
+                     "block", FALSE,                 // drop when full (latency over completeness)
+        "max-bytes", (guint64)(2*1024*1024),
+                     "stream-type", GST_APP_STREAM_TYPE_STREAM,
+                     NULL);
+        gst_app_src_set_caps(GST_APP_SRC(gc->appsrc_e), caps_rtp);
+        g_object_set(capsf_rtp,  "caps", caps_rtp, NULL);
+        gst_caps_unref(caps_rtp);
+
+        // queue (pre-jitterbuffer): match your leaky/limits
+        g_object_set(gc->queue0,
+                     "leaky", 2,                 // downstream
+                     "max-size-buffers", 96,
+                     "max-size-bytes", 0,
+                     "max-size-time", (guint64)0,
+                     NULL);
+
+        // jitterbuffer as requested
+        g_object_set(gc->jbuf,
+                     "latency", 4,
+                     "drop-on-latency", TRUE,
+                     "do-lost", TRUE,
+                     "post-drop-messages", TRUE,
+                     NULL);
+
+        // parser as requested
+        g_object_set(gc->parser, "config-interval", -1, NULL);
+        g_object_set(gc->capsf_h265, "caps", caps_h265, NULL);
+        gst_caps_unref(caps_h265);
+
+        // sink sync (false to reduce latency)
+        g_object_set(gc->sink, "sync", gc->sync ? FALSE : FALSE, NULL); // force false per your pipeline
+
+        // Assemble
+        gst_bin_add_many(GST_BIN(gc->pipeline),
+                         gc->appsrc_e, capsf_rtp, gc->queue0, gc->jbuf,
+                         gc->depay, gc->parser, gc->capsf_h265,
+                         gc->decoder, gc->queue_postdec, gc->sink, NULL);
+
+        if (!gst_element_link_many(gc->appsrc_e, capsf_rtp, gc->queue0, gc->jbuf, gc->depay,
+            gc->parser, gc->capsf_h265, gc->decoder, gc->queue_postdec, gc->sink, NULL)) {
+            g_printerr("Pipeline link failed.\n");
         return FALSE;
-    }
+            }
 
-    gc->pipeline = gst_pipeline_new("udp-h265-viewer");
-    if (!gc->pipeline) { g_printerr("Failed to create pipeline.\n"); return FALSE; }
+            // Decoder src probe for FPS
+            GstPad *dec_src = gst_element_get_static_pad(gc->decoder, "src");
+            if (dec_src) {
+                gst_pad_add_probe(dec_src, GST_PAD_PROBE_TYPE_BUFFER, dec_src_probe, NULL, NULL);
+                gst_object_unref(dec_src);
+            }
 
-    // CAPS (include media=video)
-    gchar *caps_str = g_strdup_printf(
-        "application/x-rtp,media=video,encoding-name=H265,payload=%d,clock-rate=%d",
-        gc->payload, gc->clockrate);
-    GstCaps *caps = gst_caps_from_string(caps_str);
-    g_free(caps_str);
-    if (!caps) { g_printerr("Failed to build RTP caps.\n"); return FALSE; }
+            // Bus
+            GstBus *bus = gst_element_get_bus(gc->pipeline);
+            gst_bus_add_watch(bus, bus_cb, gc);
+            gst_object_unref(bus);
 
-    // appsrc config
-    g_object_set(gc->appsrc_e,
-                 "is-live", TRUE,
-                 "format", GST_FORMAT_BYTES,     // 1 buffer = 1 RTP datagram
-                 "block", FALSE,                 // favor latency (drop when full)
-    "max-bytes", (guint64)(2*1024*1024),
-                 "stream-type", GST_APP_STREAM_TYPE_STREAM,
-                 NULL);
+            // Appsrc callbacks to gate pushing precisely
+            GstAppSrcCallbacks cbs = { on_need_data, on_enough_data, NULL };
+            gst_app_src_set_callbacks(GST_APP_SRC(gc->appsrc_e), &cbs, NULL, NULL);
 
-    // Set caps via API so a CAPS event is sent
-    gst_app_src_set_caps(GST_APP_SRC(gc->appsrc_e), caps);
-    // capsfilter with same caps (defensive)
-    g_object_set(capsf, "caps", caps, NULL);
-    gst_caps_unref(caps);
-
-    // Low-latency queue (drop oldest when downstream blocks)
-    g_object_set(gc->queue0,
-                 "leaky", 2, // downstream
-                 "max-size-buffers", 200,
-                 "max-size-bytes", 0,
-                 "max-size-time", (guint64)200000000, // 200ms
-                 NULL);
-
-    // jitterbuffer
-    g_object_set(gc->jbuf, "latency", 8, NULL);
-
-    // sink sync
-    g_object_set(gc->sink, "sync", gc->sync, NULL);
-
-    // Assemble
-    gst_bin_add_many(GST_BIN(gc->pipeline),
-                     gc->appsrc_e, capsf, gc->queue0, gc->jbuf, gc->depay, gc->decoder, gc->sink, NULL);
-    if (!gst_element_link_many(gc->appsrc_e, capsf, gc->queue0, gc->jbuf, gc->depay, gc->decoder, gc->sink, NULL)) {
-        g_printerr("Pipeline link failed.\n");
-        return FALSE;
-    }
-
-    // Decoder src probe for FPS
-    GstPad *dec_src = gst_element_get_static_pad(gc->decoder, "src");
-    if (dec_src) {
-        gst_pad_add_probe(dec_src, GST_PAD_PROBE_TYPE_BUFFER, dec_src_probe, NULL, NULL);
-        gst_object_unref(dec_src);
-    }
-
-    // Bus
-    GstBus *bus = gst_element_get_bus(gc->pipeline);
-    gst_bus_add_watch(bus, bus_cb, gc);
-    gst_object_unref(bus);
-
-    // Appsrc callbacks to gate pushing precisely
-    GstAppSrcCallbacks cbs = { on_need_data, on_enough_data, NULL };
-    gst_app_src_set_callbacks(GST_APP_SRC(gc->appsrc_e), &cbs, NULL, NULL);
-
-    return TRUE;
+            return TRUE;
 }
 
 // --------------- glue ---------------
@@ -765,7 +815,7 @@ int main(int argc, char **argv) {
 
     g_gst.payload   = 97;
     g_gst.clockrate = 90000;
-    g_gst.sync      = TRUE;
+    g_gst.sync      = FALSE; // waylandsink sync=false desired; keep arg for future but default false
 
     g_mutex_init(&g_dec.lock);
     g_dec.frames_total = 0; g_dec.first_us = 0; g_dec.prev_frames = 0; g_dec.prev_us = 0;
