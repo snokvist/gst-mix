@@ -1,0 +1,2 @@
+gcc -std=c11 -O2 -Wall main.c -o udp-h265-viewer \
+  $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-video-1.0 gobject-2.0 glib-2.0)
